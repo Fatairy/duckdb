@@ -239,42 +239,57 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
 			// }
 		idx_t new_group_count = 0;
 		bool has_updates = false;
-		Vector addresses(LogicalType::POINTER);
 		if (gstate.use_aggregation) {
+            Vector addresses(LogicalType::POINTER);
             new_group_count = gstate.ht->FindOrCreateGroups(distinct_rows, addresses, gstate.new_groups);
 
-            // Get current aggregated values BEFORE adding the chunk
-            DataChunk before_values;
-            before_values.Initialize(Allocator::DefaultAllocator(), payload_types);
-            gstate.ht->FetchAggregates(distinct_rows, before_values);
+            // OPTIMIZED: Only fetch aggregates once and track if AddChunk actually changes values
+            DataChunk current_values;
+            current_values.Initialize(Allocator::DefaultAllocator(), payload_types);
+            gstate.ht->FetchAggregates(distinct_rows, current_values);
             
-            // Add the chunk (this will update MIN values if better)
-            gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
-            
-            // Get aggregated values AFTER adding the chunk
-            DataChunk after_values;
-            after_values.Initialize(Allocator::DefaultAllocator(), payload_types);
-            gstate.ht->FetchAggregates(distinct_rows, after_values);
-            
+            // For MIN/MAX aggregation, we can determine if values will change by comparing input values
+            // before doing the expensive AddChunk operation
             has_updates = false;
-            for (idx_t row = 0; row < distinct_rows.size(); row++) {
-                for (idx_t col = 0; col < payload_types.size(); col++) {
-                    auto before_val = before_values.GetValue(col, row);
-                    auto after_val = after_values.GetValue(col, row);
-
-                    if (Value::NotDistinctFrom(before_val, after_val) == false) {
-                        has_updates = true;
-                        // printf("MIN update detected for x=%s: %s -> %s\n",
-                        //        distinct_rows.GetValue(0, row).ToString().c_str(),
-                        //        before_val.ToString().c_str(),
-                        //        after_val.ToString().c_str());
-                        break;
+            
+            // Check if new groups were created - they always constitute updates
+            if (new_group_count > 0) {
+                has_updates = true;
+            } else {
+                // For existing groups, check if the new payload values would change the aggregates
+                const idx_t num_rows = distinct_rows.size();
+                const idx_t num_cols = payload_types.size();
+                
+                for (idx_t row = 0; row < num_rows && !has_updates; row++) {
+                    for (idx_t col = 0; col < num_cols; col++) {
+                        auto current_val = current_values.GetValue(col, row);
+                        auto new_val = payload_rows.GetValue(col, row);
+                        
+                        // For MIN aggregation: update if new value is smaller
+                        // For MAX aggregation: update if new value is larger  
+                        bool would_update = false;
+                        if (use_min_key) {
+                            would_update = (Value::NotDistinctFrom(new_val, current_val) == false) && 
+                                          (new_val < current_val);
+                        } else if (use_max_key) {
+                            would_update = (Value::NotDistinctFrom(new_val, current_val) == false) && 
+                                          (new_val > current_val);
+                        } else {
+                            // For other aggregates (LAST), assume it always updates
+                            would_update = Value::NotDistinctFrom(new_val, current_val) == false;
+                        }
+                        
+                        if (would_update) {
+                            has_updates = true;
+                            break;
+                        }
                     }
                 }
-                if (has_updates) break;
             }
             
+            // Only perform the expensive AddChunk if we know there will be updates
             if (has_updates) {
+                gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
                 gstate.intermediate_table.Append(chunk);
             }
 
