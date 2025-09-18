@@ -12,7 +12,8 @@
 #include "duckdb/storage/buffer_manager.hpp"
 
 #include <utility>
-
+#include <iostream>
+#include <fstream>
 namespace duckdb {
 
 PhysicalRecursiveCTE::PhysicalRecursiveCTE(PhysicalPlan &physical_plan, string ctename, idx_t table_index,
@@ -45,9 +46,7 @@ public:
 		                                          op.payload_types, payload_aggregates_ptr);
 
 		// MODIFICATION: Use the actual flags from the operator instead of hardcoded value
-		// use_aggregation = op.use_min_key || op.use_max_key;
-		use_aggregation = op.use_min_key;
-		is_min_aggregation = op.use_min_key;
+		use_aggregation = op.use_min_key || op.use_max_key;
 	}
 
 	unique_ptr<GroupedAggregateHashTable> ht;
@@ -63,7 +62,6 @@ public:
 	// MODIFICATION: Replace the hardcoded boolean with actual state
 	bool has_converged = false;
 	bool use_aggregation = false;  // Whether to use MIN/MAX aggregation
-	bool is_min_aggregation = false;  // true for MIN, false for MAX
 
 	// END
 
@@ -99,19 +97,112 @@ void PopulateChunk(DataChunk &group_chunk, DataChunk &input_chunk, const vector<
 	}
 	group_chunk.SetCardinality(input_chunk.size());
 }
+// Call this right after your FindOrCreate/AddChunk logic,
 
+static inline void PrintKeysAddrsNewGroups(
+    duckdb::DataChunk &distinct_rows,
+    duckdb::Vector &addresses,                    // from FindOrCreateGroups(...)
+    const duckdb::SelectionVector &new_groups,    // filled by FindOrCreateGroups
+    duckdb::idx_t new_groups_count,
+    const char *path = "test_debug_ht.txt") {
+
+    FILE *fp = std::fopen(path, "a");
+    if (!fp) return;
+
+    const duckdb::idx_t n = distinct_rows.size();
+    const duckdb::idx_t kcols = distinct_rows.ColumnCount();
+
+    // Ensure addresses is flat before reading
+    addresses.Flatten(n);
+
+    using namespace duckdb;
+    const auto addr_type = addresses.GetType().id();
+    const auto &validity = FlatVector::Validity(addresses);
+
+    // Helper lambdas
+    auto print_key_row = [&](idx_t r) {
+        std::fprintf(fp, "key=[");
+        for (idx_t c = 0; c < kcols; c++) {
+            if (c) std::fprintf(fp, ", ");
+            auto s = distinct_rows.GetValue(c, r).ToString();
+            std::fprintf(fp, "%s", s.c_str());
+        }
+        std::fprintf(fp, "] ");
+    };
+
+    auto print_addr = [&](idx_t r) {
+        if (!validity.RowIsValid(r)) {
+            std::fprintf(fp, "addr=NULL\n");
+            return;
+        }
+        switch (addr_type) {
+        case LogicalTypeId::POINTER: {
+            auto data = FlatVector::GetData<data_ptr_t>(addresses);
+            std::fprintf(fp, "addr=%p\n", (void*)data[r]);
+            break;
+        }
+        case LogicalTypeId::UBIGINT: {
+            auto data = FlatVector::GetData<uint64_t>(addresses);
+            std::fprintf(fp, "addr=0x%llx\n", (unsigned long long)data[r]);
+            break;
+        }
+        case LogicalTypeId::BIGINT: {
+            auto data = FlatVector::GetData<int64_t>(addresses);
+            std::fprintf(fp, "addr=%lld (0x%llx)\n",
+                         (long long)data[r], (unsigned long long)data[r]);
+            break;
+        }
+        default: {
+            // Fallback: still safe, but less precise
+            auto s = addresses.GetValue(r).ToString();
+            std::fprintf(fp, "addr=%s\n", s.c_str());
+            break;
+        }
+        }
+    };
+
+    // Print keys + addresses row-aligned
+    for (duckdb::idx_t r = 0; r < n; r++) {
+        print_key_row(r);
+        print_addr(r);
+    }
+
+    // Print the new_groups selection
+    std::fprintf(fp, "new_groups_indices=[");
+    for (duckdb::idx_t i = 0; i < new_groups_count; i++) {
+        if (i) std::fprintf(fp, ", ");
+        std::fprintf(fp, "%u", (unsigned)new_groups.get_index(i));
+    }
+    std::fprintf(fp, "]\n");
+
+    std::fclose(fp);
+}
 SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<RecursiveCTEState>();
 
 	lock_guard<mutex> guard(gstate.intermediate_table_lock);
+	// // Debug: Print incoming chunk
+	// printf("=== INCOMING CHUNK ===\n");
+	// for (idx_t row = 0; row < chunk.size(); row++) {
+	// 	printf("Row %llu: x=%s, c=%s\n",
+	// 	       (unsigned long long)row,
+	// 	       chunk.GetValue(0, row).ToString().c_str(),
+	// 	       chunk.GetValue(1, row).ToString().c_str());
+	// }
+	// printf("======================\n");
+
 	if (!using_key) {
+
+
 		if (!union_all) {
 			idx_t match_count = ProbeHT(chunk, gstate);
 			if (match_count > 0) {
 				gstate.intermediate_table.Append(chunk);
 
+
 			}
 		} else {
+
 			gstate.intermediate_table.Append(chunk);
 
 		}
@@ -120,11 +211,22 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
 		DataChunk distinct_rows;
 		distinct_rows.Initialize(Allocator::DefaultAllocator(), distinct_types);
 		PopulateChunk(distinct_rows, chunk, distinct_idx, true);
+
 		DataChunk payload_rows;
 		if (!payload_types.empty()) {
 			payload_rows.Initialize(Allocator::DefaultAllocator(), payload_types);
 		}
 		PopulateChunk(payload_rows, chunk, payload_idx, true);
+		// Debug: Print what we're about to process
+		// printf("=== PROCESSING KEYS/PAYLOAD ===\n");
+		// for (idx_t row = 0; row < distinct_rows.size(); row++) {
+		// 	printf("Key row %llu: x=%s, payload c=%s\n",
+		// 	       (unsigned long long)row,
+		// 	       distinct_rows.GetValue(0, row).ToString().c_str(),
+		// 	       payload_rows.size() > 0 ? payload_rows.GetValue(0, row).ToString().c_str() : "N/A");
+		// }
+		// printf("===============================\n");
+
 		//MODIFICATION
 		// Use FindOrCreateGroups to detect new groups and get addresses
 			// OLD IMPLEMENTATION OF ITERATION
@@ -132,24 +234,89 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
 			// if (gstate.min_function) {
 			// 	Vector addresses(LogicalType::POINTER);
 			// 	new_group_count = gstate.ht->FindOrCreateGroups(distinct_rows, addresses, gstate.new_groups);
+
 			//
 			// }
 		idx_t new_group_count = 0;
 		bool has_updates = false;
-
+		Vector addresses(LogicalType::POINTER);
 		if (gstate.use_aggregation) {
-			Vector addresses(LogicalType::POINTER);
-			new_group_count = gstate.ht->FindOrCreateGroups(distinct_rows, addresses, gstate.new_groups);
-			has_updates = new_group_count > 0;
-		}
+            new_group_count = gstate.ht->FindOrCreateGroups(distinct_rows, addresses, gstate.new_groups);
+
+            // Get current aggregated values BEFORE adding the chunk
+            DataChunk before_values;
+            before_values.Initialize(Allocator::DefaultAllocator(), payload_types);
+            gstate.ht->FetchAggregates(distinct_rows, before_values);
+            
+            // Add the chunk (this will update MIN values if better)
+            gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
+            
+            // Get aggregated values AFTER adding the chunk
+            DataChunk after_values;
+            after_values.Initialize(Allocator::DefaultAllocator(), payload_types);
+            gstate.ht->FetchAggregates(distinct_rows, after_values);
+            
+            has_updates = false;
+            for (idx_t row = 0; row < distinct_rows.size(); row++) {
+                for (idx_t col = 0; col < payload_types.size(); col++) {
+                    auto before_val = before_values.GetValue(col, row);
+                    auto after_val = after_values.GetValue(col, row);
+
+                    if (Value::NotDistinctFrom(before_val, after_val) == false) {
+                        has_updates = true;
+                        // printf("MIN update detected for x=%s: %s -> %s\n",
+                        //        distinct_rows.GetValue(0, row).ToString().c_str(),
+                        //        before_val.ToString().c_str(),
+                        //        after_val.ToString().c_str());
+                        break;
+                    }
+                }
+                if (has_updates) break;
+            }
+            
+            if (has_updates) {
+                gstate.intermediate_table.Append(chunk);
+            }
+
+        }
 
 		//END
 		// Add the chunk to the hash table and append it to the intermediate table
 		gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
 
+		// init result chunk with the saved types (no 'op' here)
+		auto &alloc = duckdb::Allocator::DefaultAllocator();
+		duckdb::DataChunk agg_values;
+		agg_values.Initialize(alloc, payload_types);
 
-		// MODIFICATION
+		// fetch aggregates for these keys
+		gstate.ht->FetchAggregates(distinct_rows, agg_values);
+
+		// // write keys + values to a file (debug only)
+		// FILE *fp = fopen("test_debug_ht.txt", "a");
+		// if (fp) {
+		// 	for (duckdb::idx_t r = 0; r < distinct_rows.size(); r++) {
+		// 		// keys
+		// 		fprintf(fp, "key=[");
+		// 		for (duckdb::idx_t c = 0; c < distinct_rows.ColumnCount(); c++) {
+		// 			if (c) fprintf(fp, ", ");
+		// 			auto s = distinct_rows.GetValue(c, r).ToString();
+		// 			fprintf(fp, "%s", s.c_str());
+		// 		}
+		// 		// values
+		// 		fprintf(fp, "] values=[");
+		// 		for (duckdb::idx_t c = 0; c < agg_values.ColumnCount(); c++) {
+		// 			if (c) fprintf(fp, ", ");
+		// 			auto s = agg_values.GetValue(c, r).ToString();
+		// 			fprintf(fp, "%s", s.c_str());
+		// 		}
+		// 		fprintf(fp, "]\n");
+		// 	}
+		// 	fprintf(fp, "############################\n");
+		// 	fclose(fp);
+		// }
 		// I COMMENTED THIS TO MODIFY THE INTERMIDATE TABLE WITH ONLY NEW VALUES
+
 		if (gstate.use_aggregation) {
 			// Check if new entries were added to the hash table
 			// OLD IMPLEMENTATION
@@ -157,11 +324,16 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
 			// 	gstate.has_converged = false;
 			// }
 			// Only append rows that were actually inserted or updated in the hash table
+
 			if (has_updates) {
 				// Create a filtered chunk containing only the rows that caused updates
 				DataChunk filtered_chunk;
 				filtered_chunk.Initialize(Allocator::DefaultAllocator(), chunk.GetTypes());
 				filtered_chunk.Slice(chunk, gstate.new_groups, new_group_count);
+
+				filtered_chunk.Slice(chunk, gstate.new_groups, new_group_count);
+
+
 
 				gstate.intermediate_table.Append(filtered_chunk);
 			}

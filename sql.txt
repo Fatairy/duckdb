@@ -1,0 +1,101 @@
+with recursive aoc16_input(i) as (select '
+###############
+#.......#....E#
+#.#.###.#.###.#
+#.....#.#...#.#
+#.###.#####.#.#
+#.#.#.......#.#
+#.#.#####.###.#
+#...........#.#
+###.#.#####.#.#
+#...#.....#.#.#
+#.#.#.###.#.#.#
+#.....#...#.#.#
+#.###.#.#.#.#.#
+#S..#.....#...#
+###############
+'),
+lines(y,line) as (
+   select 0, substr(i,1,position(E'\n' in i)-1), substr(i,position(E'\n' in i)+1)
+   from aoc16_input
+   union all
+   select y+1,substr(r,1,position(E'\n' in r)-1), substr(r,position(E'\n' in r)+1)
+   from lines l(y,l,r) where position(E'\n' in r)>0
+),
+field(x,y,v) as (
+   select x::smallint,y::smallint,substr(line,x::integer,1)
+   from (select * from lines l where line<>'') s, lateral generate_series(1,length(line)) g(x)
+),
+walls(x,y) as (select x,y from field where v='#'),
+startpos(x,y) as (select x,y from field where v='S' limit 1),
+endpos(x,y) as (select x,y from field where v='E' limit 1),
+directions(d,dx,dy) as (values(0,1::smallint,0::smallint),(1,0::smallint,1::smallint),(2,-1::smallint,0::smallint),(3,0,-1::smallint)),
+turns(td,tc) as (values(0,0),(1,1000),(2,2000),(3,1000)),
+part1steps(r,x,y,d,c) as (
+   select 0,x,y,0,0 from startpos
+   union all (
+       with tmp(r,x,y,d,c) as (select * from part1steps),
+            agg(r,x,y,d,c) as (select r,x,y,d,min(c) from (
+                                                              select r,x,y,(d+td)%4 as d,c+tc as c from tmp cross join turns
+                                                          ) s group by r,x,y,d)
+       select r+1,(x+dx)::smallint,(y+dy)::smallint,d,c+1
+       from agg a natural join directions where not exists(select * from walls w where a.x+dx=w.x and a.y+dy=w.y)
+                                            and r<(select count(*) from field)
+   )),
+part1steps2(x,y,d,c) as (select x, y, d, min(c)
+                         from part1steps
+                         group by x, y, d),
+-- First find all minimum costs for each position and direction
+part1steps3(x, y, d, c) using KEY(x,y,d) MIN AS (
+    SELECT x, y, 0, 0  -- Start facing East (direction 0)
+    FROM startpos
+
+    UNION (
+        -- Move forward in current direction (cost +1)
+        SELECT
+            (pt.x + dx)::smallint,
+            (pt.y + dy)::smallint,
+            pt.d,
+            pt.c + 1
+        FROM part1steps3 pt
+        NATURAL JOIN directions
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM walls w
+            WHERE pt.x + dx = w.x AND pt.y + dy = w.y
+        )
+
+        UNION
+
+        -- Turn left (cost +1000)
+        SELECT pt.x, pt.y, (pt.d + 3) % 4, pt.c + 1000
+        FROM part1steps3 pt
+
+         UNION
+
+        -- Turn right (cost +1000)
+        SELECT pt.x, pt.y, (pt.d + 1) % 4, pt.c + 1000
+        FROM part1steps3 pt
+
+    )
+),
+part1steps4(x,y,d,c) as (select x, y, d, min(c)
+                         from part1steps3
+                         group by x, y, d)
+SELECT yp, STRING_AGG(cell, ' | ' ORDER BY xp) AS row
+FROM (
+SELECT
+    yp, xp,
+    CONCAT(
+        COALESCE(rpad(MAX(CASE WHEN d = 0 THEN c END)::text, 5, ' '), '     '), ' ',
+        COALESCE(rpad(MAX(CASE WHEN d = 1 THEN c END)::text, 5, ' '), '     '), ' ',
+        COALESCE(rpad(MAX(CASE WHEN d = 2 THEN c END)::text, 5, ' '), '     '), ' ',
+        COALESCE(rpad(MAX(CASE WHEN d = 3 THEN c END)::text, 5, ' '), '     ')
+    ) AS cell
+FROM part1steps4
+RIGHT JOIN (SELECT x, y FROM generate_series((select min(x)+1 from field), (select max(x)-1 from field)) as tbl1(x), generate_series((select min(y)+1 from field), (select max(y)-1 from field)) as tbl2(y)) tbl3(xp, yp) ON (xp = x AND yp = y)
+GROUP BY yp, xp
+ORDER BY yp, xp
+) q
+GROUP BY yp
+ORDER BY yp;

@@ -1,0 +1,16 @@
+with recursive
+rec(x, c) using key (x) min as (
+    select 0, 0
+    union
+    (
+        select x+1, c+1000 from rec where x+1 <= 10
+        union all
+        select x+10, c+1 from rec where x+10 <= 10
+        union all
+        select x-1, c+1 from rec where x > 0
+    )
+)
+select x, min(c)
+from rec
+group by x
+order by x;

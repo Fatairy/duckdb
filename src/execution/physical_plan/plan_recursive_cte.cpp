@@ -97,7 +97,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalRecursiveCTE &op) {
 				// Use MAX aggregate for MAXKEY
 				aggregate = function_binder.BindAggregateFunction(MaxFunction::GetFunction(),
 										std::move(first_children), nullptr, AggregateType::NON_DISTINCT);
-				// has_min_max_aggregates = true;  // Track that we used MIN/MAX
+				has_min_max_aggregates = true;  // Track that we used MIN/MAX
 
 			} else {
 				// Default: use LAST aggregate

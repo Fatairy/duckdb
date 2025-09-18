@@ -198,6 +198,11 @@ local.properties
 # Java annotation processor (APT)
 .factorypath
 
+sql.txt
+text.txt
+debug_ht.txt
+full_sql.txt
+test_debug_ht.txt
 # PDT-specific (PHP Development Tools)
 .buildpath
 
