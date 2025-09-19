@@ -165,17 +165,11 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
 
             			// Create result vectors for comparison
             			Vector comparison_result(LogicalType::BOOLEAN);
-            			Vector not_equal_result(LogicalType::BOOLEAN);
-
-            			// First check if values are different (vectorized)
-            			VectorOperations::NotDistinctFrom(current_vector, new_vector, not_equal_result, num_rows);
-            			VectorOperations::Not(not_equal_result, not_equal_result, num_rows);
-
             			if (use_min_key) {
-            				// Check if new_val < current_val (vectorized)
+            				// Check if new_val < current_val
             				VectorOperations::LessThan(new_vector, current_vector, comparison_result, num_rows);
             			} else {
-            				// Check if new_val > current_val (vectorized)
+            				// Check if new_val > current_val
             				VectorOperations::GreaterThan(new_vector, current_vector, comparison_result, num_rows);
             			}
             			// Check if any row in this column would cause an update
