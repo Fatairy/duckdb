@@ -99,97 +99,10 @@ void PopulateChunk(DataChunk &group_chunk, DataChunk &input_chunk, const vector<
 }
 // Call this right after your FindOrCreate/AddChunk logic,
 
-static inline void PrintKeysAddrsNewGroups(
-    duckdb::DataChunk &distinct_rows,
-    duckdb::Vector &addresses,                    // from FindOrCreateGroups(...)
-    const duckdb::SelectionVector &new_groups,    // filled by FindOrCreateGroups
-    duckdb::idx_t new_groups_count,
-    const char *path = "test_debug_ht.txt") {
-
-    FILE *fp = std::fopen(path, "a");
-    if (!fp) return;
-
-    const duckdb::idx_t n = distinct_rows.size();
-    const duckdb::idx_t kcols = distinct_rows.ColumnCount();
-
-    // Ensure addresses is flat before reading
-    addresses.Flatten(n);
-
-    using namespace duckdb;
-    const auto addr_type = addresses.GetType().id();
-    const auto &validity = FlatVector::Validity(addresses);
-
-    // Helper lambdas
-    auto print_key_row = [&](idx_t r) {
-        std::fprintf(fp, "key=[");
-        for (idx_t c = 0; c < kcols; c++) {
-            if (c) std::fprintf(fp, ", ");
-            auto s = distinct_rows.GetValue(c, r).ToString();
-            std::fprintf(fp, "%s", s.c_str());
-        }
-        std::fprintf(fp, "] ");
-    };
-
-    auto print_addr = [&](idx_t r) {
-        if (!validity.RowIsValid(r)) {
-            std::fprintf(fp, "addr=NULL\n");
-            return;
-        }
-        switch (addr_type) {
-        case LogicalTypeId::POINTER: {
-            auto data = FlatVector::GetData<data_ptr_t>(addresses);
-            std::fprintf(fp, "addr=%p\n", (void*)data[r]);
-            break;
-        }
-        case LogicalTypeId::UBIGINT: {
-            auto data = FlatVector::GetData<uint64_t>(addresses);
-            std::fprintf(fp, "addr=0x%llx\n", (unsigned long long)data[r]);
-            break;
-        }
-        case LogicalTypeId::BIGINT: {
-            auto data = FlatVector::GetData<int64_t>(addresses);
-            std::fprintf(fp, "addr=%lld (0x%llx)\n",
-                         (long long)data[r], (unsigned long long)data[r]);
-            break;
-        }
-        default: {
-            // Fallback: still safe, but less precise
-            auto s = addresses.GetValue(r).ToString();
-            std::fprintf(fp, "addr=%s\n", s.c_str());
-            break;
-        }
-        }
-    };
-
-    // Print keys + addresses row-aligned
-    for (duckdb::idx_t r = 0; r < n; r++) {
-        print_key_row(r);
-        print_addr(r);
-    }
-
-    // Print the new_groups selection
-    std::fprintf(fp, "new_groups_indices=[");
-    for (duckdb::idx_t i = 0; i < new_groups_count; i++) {
-        if (i) std::fprintf(fp, ", ");
-        std::fprintf(fp, "%u", (unsigned)new_groups.get_index(i));
-    }
-    std::fprintf(fp, "]\n");
-
-    std::fclose(fp);
-}
 SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<RecursiveCTEState>();
 
 	lock_guard<mutex> guard(gstate.intermediate_table_lock);
-	// // Debug: Print incoming chunk
-	// printf("=== INCOMING CHUNK ===\n");
-	// for (idx_t row = 0; row < chunk.size(); row++) {
-	// 	printf("Row %llu: x=%s, c=%s\n",
-	// 	       (unsigned long long)row,
-	// 	       chunk.GetValue(0, row).ToString().c_str(),
-	// 	       chunk.GetValue(1, row).ToString().c_str());
-	// }
-	// printf("======================\n");
 
 	if (!using_key) {
 
@@ -217,26 +130,8 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
 			payload_rows.Initialize(Allocator::DefaultAllocator(), payload_types);
 		}
 		PopulateChunk(payload_rows, chunk, payload_idx, true);
-		// Debug: Print what we're about to process
-		// printf("=== PROCESSING KEYS/PAYLOAD ===\n");
-		// for (idx_t row = 0; row < distinct_rows.size(); row++) {
-		// 	printf("Key row %llu: x=%s, payload c=%s\n",
-		// 	       (unsigned long long)row,
-		// 	       distinct_rows.GetValue(0, row).ToString().c_str(),
-		// 	       payload_rows.size() > 0 ? payload_rows.GetValue(0, row).ToString().c_str() : "N/A");
-		// }
-		// printf("===============================\n");
 
-		//MODIFICATION
-		// Use FindOrCreateGroups to detect new groups and get addresses
-			// OLD IMPLEMENTATION OF ITERATION
-			// idx_t new_group_count = 0;
-			// if (gstate.min_function) {
-			// 	Vector addresses(LogicalType::POINTER);
-			// 	new_group_count = gstate.ht->FindOrCreateGroups(distinct_rows, addresses, gstate.new_groups);
 
-			//
-			// }
 		idx_t new_group_count = 0;
 		bool has_updates = false;
 		if (gstate.use_aggregation) {
@@ -247,11 +142,11 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
             DataChunk current_values;
             current_values.Initialize(Allocator::DefaultAllocator(), payload_types);
             gstate.ht->FetchAggregates(distinct_rows, current_values);
-            
+
             // For MIN/MAX aggregation, we can determine if values will change by comparing input values
             // before doing the expensive AddChunk operation
             has_updates = false;
-            
+
             // Check if new groups were created - they always constitute updates
             if (new_group_count > 0) {
                 has_updates = true;
@@ -259,53 +154,84 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
                 // For existing groups, check if the new payload values would change the aggregates
                 const idx_t num_rows = distinct_rows.size();
                 const idx_t num_cols = payload_types.size();
-                
-                for (idx_t row = 0; row < num_rows && !has_updates; row++) {
-                    for (idx_t col = 0; col < num_cols; col++) {
-                        auto current_val = current_values.GetValue(col, row);
-                        auto new_val = payload_rows.GetValue(col, row);
-                        
-                        // For MIN aggregation: update if new value is smaller
-                        // For MAX aggregation: update if new value is larger  
-                        bool would_update = false;
-                        if (use_min_key) {
-                            would_update = (Value::NotDistinctFrom(new_val, current_val) == false) && 
-                                          (new_val < current_val);
-                        } else if (use_max_key) {
-                            would_update = (Value::NotDistinctFrom(new_val, current_val) == false) && 
-                                          (new_val > current_val);
-                        } else {
-                            // For other aggregates (LAST), assume it always updates
-                            would_update = Value::NotDistinctFrom(new_val, current_val) == false;
-                        }
-                        
-                        if (would_update) {
-                            has_updates = true;
-                            break;
-                        }
-                    }
-                }
+            	// Early exit for empty chunks
+            	if (num_rows == 0 || num_cols == 0) {
+            		has_updates =  false;
+
+            	}else {
+            		for (idx_t col = 0; col < num_cols; col++) {
+            			auto &current_vector = current_values.data[col];
+            			auto &new_vector = payload_rows.data[col];
+
+            			// Create result vectors for comparison
+            			Vector comparison_result(LogicalType::BOOLEAN);
+            			Vector not_equal_result(LogicalType::BOOLEAN);
+
+            			// First check if values are different (vectorized)
+            			VectorOperations::NotDistinctFrom(current_vector, new_vector, not_equal_result, num_rows);
+            			VectorOperations::Not(not_equal_result, not_equal_result, num_rows);
+
+            			if (use_min_key) {
+            				// Check if new_val < current_val (vectorized)
+            				VectorOperations::LessThan(new_vector, current_vector, comparison_result, num_rows);
+            			} else {
+            				// Check if new_val > current_val (vectorized)
+            				VectorOperations::GreaterThan(new_vector, current_vector, comparison_result, num_rows);
+            			}
+            			// Check if any row in this column would cause an update
+            			auto data = FlatVector::GetData<bool>(comparison_result);
+            			auto &validity = FlatVector::Validity(comparison_result);
+
+            			for (idx_t row = 0; row < num_rows; row++) {
+            				if (validity.RowIsValid(row) && data[row]) {
+            					has_updates =  true; // Found at least one update
+            				}
+            			}
+            		}
+
+
+            	}
+
+                //
+                // for (idx_t row = 0; row < num_rows && !has_updates; row++) {
+                //     for (idx_t col = 0; col < num_cols; col++) {
+                //         auto current_val = current_values.GetValue(col, row);
+                //         auto new_val = payload_rows.GetValue(col, row);
+                //
+                //         // For MIN aggregation: update if new value is smaller
+                //         // For MAX aggregation: update if new value is larger
+                //         bool would_update = false;
+                //         if (use_min_key) {
+                //             would_update = (Value::NotDistinctFrom(new_val, current_val) == false) &&
+                //                           (new_val < current_val);
+                //         } else {
+                //             would_update = (Value::NotDistinctFrom(new_val, current_val) == false) &&
+                //                           (new_val > current_val);
+                //         }
+                //         if (would_update) {
+                //             has_updates = true;
+                //             break;
+                //         }
+                //     }
+                // }
             }
-            
+
             // Only perform the expensive AddChunk if we know there will be updates
             if (has_updates) {
-                gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
+            	gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
+
                 gstate.intermediate_table.Append(chunk);
             }
 
         }
+		else {
+			gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
+
+		}
 
 		//END
 		// Add the chunk to the hash table and append it to the intermediate table
-		gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
 
-		// init result chunk with the saved types (no 'op' here)
-		auto &alloc = duckdb::Allocator::DefaultAllocator();
-		duckdb::DataChunk agg_values;
-		agg_values.Initialize(alloc, payload_types);
-
-		// fetch aggregates for these keys
-		gstate.ht->FetchAggregates(distinct_rows, agg_values);
 
 		// // write keys + values to a file (debug only)
 		// FILE *fp = fopen("test_debug_ht.txt", "a");
@@ -345,11 +271,6 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
 				DataChunk filtered_chunk;
 				filtered_chunk.Initialize(Allocator::DefaultAllocator(), chunk.GetTypes());
 				filtered_chunk.Slice(chunk, gstate.new_groups, new_group_count);
-
-				filtered_chunk.Slice(chunk, gstate.new_groups, new_group_count);
-
-
-
 				gstate.intermediate_table.Append(filtered_chunk);
 			}
 		}
