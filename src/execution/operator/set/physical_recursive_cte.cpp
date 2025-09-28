@@ -135,89 +135,82 @@ SinkResultType PhysicalRecursiveCTE::Sink(ExecutionContext &context, DataChunk &
 		idx_t new_group_count = 0;
 		bool has_updates = false;
 		if (gstate.use_aggregation) {
-            Vector addresses(LogicalType::POINTER);
-            new_group_count = gstate.ht->FindOrCreateGroups(distinct_rows, addresses, gstate.new_groups);
+                         Vector addresses(LogicalType::POINTER);
+                        new_group_count = gstate.ht->FindOrCreateGroups(distinct_rows, addresses, gstate.new_groups);
 
-            // OPTIMIZED: Only fetch aggregates once and track if AddChunk actually changes values
-            DataChunk current_values;
-            current_values.Initialize(Allocator::DefaultAllocator(), payload_types);
-            gstate.ht->FetchAggregates(distinct_rows, current_values);
+                        // Fetch the current aggregate values so we can compare against the incoming payload
+                        DataChunk current_values;
+                        current_values.Initialize(Allocator::DefaultAllocator(), payload_types);
+                        gstate.ht->FetchAggregates(distinct_rows, current_values);
 
-            // For MIN/MAX aggregation, we can determine if values will change by comparing input values
-            // before doing the expensive AddChunk operation
-            has_updates = false;
+                        const idx_t num_rows = distinct_rows.size();
+                        const idx_t num_cols = payload_types.size();
 
-            // Check if new groups were created - they always constitute updates
-            if (new_group_count > 0) {
-                has_updates = true;
-            } else {
-                // For existing groups, check if the new payload values would change the aggregates
-                const idx_t num_rows = distinct_rows.size();
-                const idx_t num_cols = payload_types.size();
-            	// Early exit for empty chunks
-            	if (num_rows == 0 || num_cols == 0) {
-            		has_updates =  false;
+                        // Track per-row updates so we can both detect changes and build the selection vector
+                        vector<bool> row_has_update(num_rows, false);
 
-            	}else {
-            		for (idx_t col = 0; col < num_cols; col++) {
-            			auto &current_vector = current_values.data[col];
-            			auto &new_vector = payload_rows.data[col];
+                        // Any newly created group is considered an update
+                        for (idx_t i = 0; i < new_group_count; i++) {
+                                const idx_t row_index = gstate.new_groups.get_index(i);
+                                if (row_index < num_rows) {
+                                        row_has_update[row_index] = true;
+                                }
+                        }
 
-            			// Create result vectors for comparison
-            			Vector comparison_result(LogicalType::BOOLEAN);
-            			if (use_min_key) {
-            				// Check if new_val < current_val
-            				VectorOperations::LessThan(new_vector, current_vector, comparison_result, num_rows);
-            			} else {
-            				// Check if new_val > current_val
-            				VectorOperations::GreaterThan(new_vector, current_vector, comparison_result, num_rows);
-            			}
-            			// Check if any row in this column would cause an update
-            			auto data = FlatVector::GetData<bool>(comparison_result);
-            			auto &validity = FlatVector::Validity(comparison_result);
+                        // For existing groups, check whether the MIN/MAX aggregate would change
+                        if (num_rows > 0 && num_cols > 0) {
+                                for (idx_t row = 0; row < num_rows; row++) {
+                                        if (row_has_update[row]) {
+                                                continue;
+                                        }
+                                        for (idx_t col = 0; col < num_cols; col++) {
+                                                auto new_val = payload_rows.GetValue(col, row);
+                                                if (new_val.IsNull()) {
+                                                        // Null payloads do not contribute to MIN/MAX
+                                                        continue;
+                                                }
 
-            			for (idx_t row = 0; row < num_rows; row++) {
-            				if (validity.RowIsValid(row) && data[row]) {
-            					has_updates =  true; // Found at least one update
-            				}
-            			}
-            		}
+                                                auto current_val = current_values.GetValue(col, row);
+                                                if (current_val.IsNull()) {
+                                                        // Transition from NULL to a concrete value always updates the aggregate
+                                                        row_has_update[row] = true;
+                                                        break;
+                                                }
+												if (use_min_key) {
+													const bool improves_min = new_val < current_val;
+													if (improves_min ) {
+														row_has_update[row] = true;
+														break;
+													}
+												}else {
+													const bool improves_max = new_val > current_val;
+													if (improves_max ) {
+														row_has_update[row] = true;
+														break;
+													}
+												}
 
+                                        }
+                                }
+                        }
 
-            	}
+                        // Build a selection vector containing all rows that update the hash table
+                        idx_t update_count = 0;
+                        for (idx_t row = 0; row < num_rows; row++) {
+                                if (row_has_update[row]) {
+                                        gstate.new_groups.set_index(update_count++, row);
+                                }
+                        }
 
-                //
-                // for (idx_t row = 0; row < num_rows && !has_updates; row++) {
-                //     for (idx_t col = 0; col < num_cols; col++) {
-                //         auto current_val = current_values.GetValue(col, row);
-                //         auto new_val = payload_rows.GetValue(col, row);
-                //
-                //         // For MIN aggregation: update if new value is smaller
-                //         // For MAX aggregation: update if new value is larger
-                //         bool would_update = false;
-                //         if (use_min_key) {
-                //             would_update = (Value::NotDistinctFrom(new_val, current_val) == false) &&
-                //                           (new_val < current_val);
-                //         } else {
-                //             would_update = (Value::NotDistinctFrom(new_val, current_val) == false) &&
-                //                           (new_val > current_val);
-                //         }
-                //         if (would_update) {
-                //             has_updates = true;
-                //             break;
-                //         }
-                //     }
-                // }
-            }
+                        has_updates = update_count > 0;
+                        new_group_count = update_count;
 
-            // Only perform the expensive AddChunk if we know there will be updates
-            if (has_updates) {
-            	gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
+                        // Only perform the expensive AddChunk if we know there will be updates
+                        if (has_updates) {
+                                gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
+                        }
 
-                gstate.intermediate_table.Append(chunk);
-            }
-
-        }
+                }
 		else {
 			gstate.ht->AddChunk(distinct_rows, payload_rows, AggregateType::NON_DISTINCT);
 
